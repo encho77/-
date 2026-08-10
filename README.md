@@ -58,6 +58,10 @@ $env:TOKEN="여기에_발급받은_봇_토큰"
 python main.py
 ```
 
+실행하면 다음이 출력됩니다:
+- `Flask 웹 서버 시작: 포트 5000` → 헬스 체크 엔드포인트 `http://localhost:5000/`이 실행됨
+- `봇 로그인 완료` → Discord 봇이 정상 실행 중
+
 `.env` 파일을 쓰고 싶다면 `python-dotenv`를 별도로 설치(`pip install python-dotenv`)한 뒤,
 `main.py` 최상단에 아래 두 줄을 추가하면 됩니다. (기본 프로젝트에는 의존성을 최소화하기 위해 포함하지 않았습니다)
 
@@ -85,14 +89,19 @@ git push -u origin main
 
 ---
 
-## 4. Render 배포
+## 4. Render 배포 (Web Service + UptimeRobot)
 
-1. https://render.com 접속 → **New → Web Service** (또는 **Background Worker**, 아래 참고)
+**무료로 운영하려면 Web Service + UptimeRobot 조합을 사용하세요.**
+
+### 4-1. Render에서 Web Service 설정
+
+1. https://render.com 접속 → **New → Web Service**
 2. GitHub 저장소 연결
 3. **Build Command**: `pip install -r requirements.txt`
 4. **Start Command**: `python main.py`
+5. **Environment** 탭에서 아래 변수 추가
 
-### Environment Variables (Render 대시보드 → Environment)
+### 4-2. Environment Variables (Render 대시보드 → Environment)
 
 | Key | Value | 설명 |
 |---|---|---|
@@ -101,7 +110,24 @@ git push -u origin main
 | `MAX_CAPSULES_PER_USER` | 예: `10` | 선택, 사용자당 최대 보관 개수 (기본값 10) |
 | `CHECK_INTERVAL_SECONDS` | 예: `30` | 선택, 전송 확인 주기(초) (기본값 30) |
 
-> 이 봇은 웹 서버가 아니라 상시 실행되는 프로세스이므로, Render의 **Background Worker** 유형으로 배포하는 것을 권장합니다. Web Service로 배포할 경우 Render가 헬스체크를 위한 포트 바인딩을 요구할 수 있으니, 만약 오류가 발생하면 Background Worker로 전환해주세요.
+### 4-3. Render Web Service 슬립 방지: UptimeRobot 연동
+
+Render의 무료 Web Service는 **15분간 요청이 없으면 자동으로 슬립**됩니다. 봇이 계속 깨어있으려면 **UptimeRobot**으로 주기적인 핑을 보내주세요.
+
+#### UptimeRobot 설정 단계:
+
+1. https://uptimerobot.com 접속 → 회원가입/로그인
+2. **Add New Monitor** 클릭
+3. 설정값:
+   - **Monitor Type**: HTTP(s)
+   - **Friendly Name**: Time Capsule Bot 또는 원하는 이름
+   - **URL**: `https://your-render-url.onrender.com/` (Render 배포 후 생성되는 URL)
+   - **Monitoring Interval**: 5분 (기본값, 무료 플랜에서 지원하는 최단 간격)
+4. **Create Monitor** 클릭
+
+이제 UptimeRobot이 5분마다 봇의 웹 서버에 요청을 보내서 슬립을 방지합니다.
+
+> ✅ 이 봇 코드는 이미 Flask로 간단한 HTTP 서버를 포함하고 있습니다. 봇 로직은 백그라운드에서 계속 실행되며, Flask는 단순히 헬스 체크 역할을 합니다.
 
 ---
 
@@ -153,3 +179,6 @@ DATABASE_PATH=/data/database.db
 | 재배포 후 타임캡슐이 사라짐 | Render의 파일 시스템 초기화 문제. 위 5번 항목 참고, Persistent Disk + `DATABASE_PATH` 설정 필요 |
 | 버튼을 눌러도 반응 없음 | `/타임캡슐` 메시지가 3분(180초)이 지나 만료됨. 명령어를 다시 실행 |
 | 같은 타임캡슐이 여러 번 전송될까 걱정됨 | DB 업데이트 시 `WHERE delivered = 0` 조건을 사용하므로 이미 전송된 캡슐은 다시 전송되지 않습니다 |
+| Render에서 15분마다 봇이 꺼짐 (Web Service) | UptimeRobot 설정을 확인하세요. URL이 정확한지 (예: `https://xxx.onrender.com/`), 모니터링이 활성화되었는지 확인 |
+| UptimeRobot이 404 에러를 나타냄 | 봇의 Render 배포 URL이 맞는지 확인. Render 대시보드의 URL을 그대로 복사해서 마지막에 `/` 를 붙여서 사용하세요 |
+| Flask 포트 충돌 에러 | 로컬에서 5000번 포트가 이미 사용 중일 수 있습니다. 다른 프로그램을 종료하거나, 환경변수 `PORT=8080` 같이 다른 포트로 설정 |
