@@ -8,17 +8,23 @@ main.py
 - /타임캡슐조회  : 특정 타임캡슐의 상세 상태 확인
 - /타임캡슐취소  : 아직 도착하지 않은 타임캡슐 취소
 - 도착 시간이 되면 백그라운드 작업이 DM으로 자동 전송 (봇 재시작에도 유지됨)
+
+Render Web Service 배포용:
+- Flask로 간단한 HTTP 서버 실행 (UptimeRobot이 주기적으로 핑을 보내 슬립 방지)
+- 스레드에서 Flask 실행, 메인 스레드에서 봇 실행
 """
 
 import os
 import asyncio
 import logging
+import threading
 from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dateutil.relativedelta import relativedelta
+from flask import Flask
 
 import database as db
 
@@ -39,6 +45,10 @@ if not TOKEN:
     raise RuntimeError(
         "환경변수 TOKEN이 설정되지 않았습니다. Discord Bot Token을 환경변수로 설정해주세요."
     )
+
+# Render Web Service에서는 PORT 환경변수가 자동 지정됨 (보통 10000)
+# 로컬 테스트 시에는 5000번 포트 사용
+PORT = int(os.getenv("PORT", 5000))
 
 # 사용자 1인당 최대 대기 중(미전송) 타임캡슐 개수
 MAX_CAPSULES_PER_USER = int(os.getenv("MAX_CAPSULES_PER_USER", "10"))
@@ -247,6 +257,30 @@ class DurationSelectView(discord.ui.View):
                 await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
+
+
+# ─────────────────────────────────────────────
+# Flask 웹 서버 (Render Web Service 슬립 방지용)
+# ─────────────────────────────────────────────
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    """UptimeRobot이 주기적으로 요청할 헬스 체크 엔드포인트"""
+    return {"status": "running", "bot": "Time Capsule Bot"}, 200
+
+
+@app.route("/ping")
+def ping():
+    """UptimeRobot 핑 테스트용 엔드포인트"""
+    return "pong", 200
+
+
+def run_flask():
+    """Flask 서버를 별도 스레드에서 실행한다. (봇 실행을 차단하지 않도록)"""
+    logger.info(f"Flask 서버 시작: 포트 {PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 
 # ─────────────────────────────────────────────
@@ -534,6 +568,12 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     try:
+        # Flask 서버를 데몬 스레드로 실행 (UptimeRobot이 주기적으로 요청하면 프로세스 계속 실행)
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        logger.info("Flask 웹 서버 스레드 시작")
+
+        # 메인 스레드에서는 Discord 봇 실행
         bot.run(TOKEN)
     except discord.LoginFailure:
         logger.error("Discord 로그인 실패: TOKEN 값이 올바른지 확인해주세요.")
