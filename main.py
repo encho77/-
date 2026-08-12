@@ -12,10 +12,13 @@ main.py
 Render Web Service 배포용:
 - Flask로 간단한 HTTP 서버 실행 (UptimeRobot이 주기적으로 핑을 보내 슬립 방지)
 - 스레드에서 Flask 실행, 메인 스레드에서 봇 실행
+
+DB 저장소: Supabase PostgreSQL (asyncpg 기반 완전 비동기 연결)
+- 기존 SQLite 방식에서 전환됨. 자세한 내용은 database.py 상단 주석 참고.
+- Render가 재배포/재시작되어도 타임캡슐 데이터는 Supabase에 그대로 유지된다.
 """
 
 import os
-import asyncio
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -77,19 +80,22 @@ def now_kst() -> datetime:
     return datetime.now(timezone.utc).astimezone(KST)
 
 
-def to_kst_str(iso_utc_str: str | None) -> str:
-    """DB에 저장된 UTC ISO 문자열을 'YYYY-MM-DD HH:MM' 형태의 KST 문자열로 변환한다."""
-    if not iso_utc_str:
+def to_kst_str(dt: datetime | None) -> str:
+    """
+    DB(asyncpg)에서 반환된 timezone-aware datetime을 'YYYY-MM-DD HH:MM' 형태의 KST 문자열로 변환한다.
+    (Supabase 전환 이후: asyncpg가 timestamptz 컬럼을 Python datetime 객체로 그대로 반환하므로
+     기존의 ISO 문자열 파싱 로직 대신 datetime 객체를 직접 받는다.)
+    """
+    if dt is None:
         return "-"
-    dt = datetime.fromisoformat(iso_utc_str)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(KST).strftime("%Y-%m-%d %H:%M")
 
 
-def remaining_str(delivery_at_iso: str) -> str:
+def remaining_str(delivery_at: datetime) -> str:
     """도착까지 남은 시간을 사람이 읽기 좋은 문자열로 반환한다."""
-    dt = datetime.fromisoformat(delivery_at_iso)
+    dt = delivery_at
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     delta = dt - datetime.now(timezone.utc)
@@ -138,11 +144,11 @@ class TimeCapsuleModal(discord.ui.Modal):
             )
             return
 
-        # 사용자별 개수 제한 확인
+        # 사용자별 개수 제한 확인 (Supabase 조회 - asyncpg는 네이티브 async이므로 to_thread 불필요)
         try:
-            active_count = await asyncio.to_thread(db.count_active_capsules, str(interaction.user.id))
+            active_count = await db.count_active_capsules(str(interaction.user.id))
         except Exception:
-            logger.exception("타임캡슐 개수 확인 중 DB 오류 발생")
+            logger.exception("타임캡슐 개수 확인 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
             await interaction.response.send_message(
                 "❌ 데이터베이스 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
                 ephemeral=True,
@@ -161,12 +167,14 @@ class TimeCapsuleModal(discord.ui.Modal):
         created_at_kst = now_kst()
         delivery_at_kst = created_at_kst + relativedelta(months=self.months)
 
-        created_at_utc = created_at_kst.astimezone(timezone.utc).isoformat()
-        delivery_at_utc = delivery_at_kst.astimezone(timezone.utc).isoformat()
+        # asyncpg는 timezone-aware datetime 객체를 timestamptz 컬럼에 그대로 저장할 수 있으므로
+        # 별도의 ISO 문자열 변환 없이 UTC datetime 객체를 바로 전달한다.
+        created_at_utc = created_at_kst.astimezone(timezone.utc)
+        delivery_at_utc = delivery_at_kst.astimezone(timezone.utc)
 
+        # 중요: DB 저장이 성공했는지 반드시 먼저 확인한 뒤에만 사용자에게 성공 메시지를 보여준다.
         try:
-            capsule_id = await asyncio.to_thread(
-                db.create_capsule,
+            capsule_id = await db.create_capsule(
                 str(interaction.user.id),
                 str(interaction.user),
                 message_text,
@@ -174,7 +182,7 @@ class TimeCapsuleModal(discord.ui.Modal):
                 delivery_at_utc,
             )
         except Exception:
-            logger.exception("타임캡슐 생성 중 DB 오류 발생")
+            logger.exception("타임캡슐 생성 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
             await interaction.response.send_message(
                 "❌ 타임캡슐 저장 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
                 ephemeral=True,
@@ -293,13 +301,18 @@ class TimeCapsuleBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # DB 초기화 (테이블이 없으면 자동 생성)
+        # Supabase(PostgreSQL) 초기화 (테이블이 없으면 자동 생성, 기존 데이터는 절대 건드리지 않음)
+        # 연결에 실패해도 raise하지 않는다: Supabase 장애/설정 누락 때문에 봇 로그인 자체가
+        # 막히지 않도록 하고, 대신 각 명령어 호출 시점에 개별적으로 오류를 안내한다.
         try:
-            await asyncio.to_thread(db.init_db)
-            logger.info(f"데이터베이스 초기화 완료 (경로: {db.DB_PATH})")
+            await db.init_db()
+            logger.info("Supabase(PostgreSQL) 데이터베이스 초기화 완료")
         except Exception:
-            logger.exception("데이터베이스 초기화 실패")
-            raise
+            logger.exception(
+                "Supabase 연결/초기화에 실패했습니다. DATABASE_URL 환경변수와 Supabase 프로젝트 상태를 "
+                "확인해주세요. 봇 로그인은 계속 진행되며, Supabase가 복구되면 다음 요청부터 자동으로 "
+                "재연결을 시도합니다."
+            )
 
         # Slash Command 동기화 (재시작마다 반복 호출되지 않도록 setup_hook에서 1회만 수행)
         try:
@@ -308,9 +321,17 @@ class TimeCapsuleBot(commands.Bot):
         except discord.HTTPException:
             logger.exception("Slash Command 동기화 실패")
 
-        # 백그라운드 전송 작업 시작 (재시작 시 DB에 남아있던 미전송 타임캡슐도 자동으로 확인됨)
+        # 백그라운드 전송 작업 시작 (재시작 시 Supabase에 남아있던 미전송 타임캡슐도 자동으로 확인됨)
         if not check_capsules.is_running():
             check_capsules.start()
+
+    async def close(self):
+        # 봇 종료 시 Supabase 커넥션 풀을 안전하게 정리한다.
+        try:
+            await db.close_pool()
+        except Exception:
+            logger.exception("Supabase 커넥션 풀 종료 중 오류 발생")
+        await super().close()
 
 
 bot = TimeCapsuleBot()
@@ -327,10 +348,11 @@ async def on_ready():
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def check_capsules():
     try:
-        now_utc_str = datetime.now(timezone.utc).isoformat()
-        pending = await asyncio.to_thread(db.get_pending_capsules, now_utc_str)
+        now_utc = datetime.now(timezone.utc)
+        pending = await db.get_pending_capsules(now_utc)
     except Exception:
-        logger.exception("미전송 타임캡슐 조회 중 DB 오류 발생")
+        # Supabase가 일시적으로 응답하지 않아도 루프 자체는 죽지 않고 다음 주기에 재시도한다.
+        logger.exception("미전송 타임캡슐 조회 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
         return
 
     for capsule in pending:
@@ -358,7 +380,7 @@ async def deliver_capsule(capsule: dict) -> None:
         user = await bot.fetch_user(int(user_id))
     except discord.NotFound:
         logger.warning(f"타임캡슐 #{capsule_id} 전송 실패: 사용자를 찾을 수 없음 (user_id={user_id})")
-        await asyncio.to_thread(db.mark_delivery_failed, capsule_id)
+        await db.mark_delivery_failed(capsule_id)
         return
     except discord.HTTPException:
         logger.exception(f"타임캡슐 #{capsule_id} 사용자 조회 중 일시적 오류 발생 (다음 주기에 재시도)")
@@ -379,20 +401,20 @@ async def deliver_capsule(capsule: dict) -> None:
     except discord.Forbidden:
         # 사용자가 DM을 차단했거나 서버를 나간 경우 등 → 영구 실패로 표시하여 무한 재시도 방지
         logger.warning(f"타임캡슐 #{capsule_id} 전송 실패: DM이 차단되어 있음 (user_id={user_id})")
-        await asyncio.to_thread(db.mark_delivery_failed, capsule_id)
+        await db.mark_delivery_failed(capsule_id)
         return
     except discord.HTTPException:
         # 일시적인 네트워크/API 오류 → 다음 주기에 다시 시도
         logger.exception(f"타임캡슐 #{capsule_id} DM 전송 중 일시적 오류 발생 (다음 주기에 재시도)")
         return
 
-    # 전송 성공 → DB 갱신 (delivered=0 조건이 있으므로 중복 전송되지 않음)
-    delivered_at_utc = datetime.now(timezone.utc).isoformat()
+    # 전송 성공 → DB 갱신 (delivered=false 조건의 원자적 UPDATE이므로 중복 전송되지 않음)
+    delivered_at_utc = datetime.now(timezone.utc)
     try:
-        await asyncio.to_thread(db.mark_delivered, capsule_id, delivered_at_utc)
+        await db.mark_delivered(capsule_id, delivered_at_utc)
         logger.info(f"타임캡슐 #{capsule_id} 전송 성공 (user_id={user_id})")
     except Exception:
-        logger.exception(f"타임캡슐 #{capsule_id} 전송 상태 업데이트 중 DB 오류 발생")
+        logger.exception(f"타임캡슐 #{capsule_id} 전송 상태 업데이트 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
 
 
 # ─────────────────────────────────────────────
@@ -419,9 +441,9 @@ async def create_time_capsule(interaction: discord.Interaction):
 @bot.tree.command(name="내타임캡슐", description="내가 만든 타임캡슐 목록을 확인합니다.")
 async def list_my_capsules(interaction: discord.Interaction):
     try:
-        capsules = await asyncio.to_thread(db.get_user_capsules, str(interaction.user.id))
+        capsules = await db.get_user_capsules(str(interaction.user.id))
     except Exception:
-        logger.exception("타임캡슐 목록 조회 중 DB 오류 발생")
+        logger.exception("타임캡슐 목록 조회 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
         await interaction.response.send_message(
             "❌ 타임캡슐 목록을 불러오는 중 오류가 발생했습니다.", ephemeral=True
         )
@@ -464,9 +486,9 @@ async def list_my_capsules(interaction: discord.Interaction):
 @app_commands.describe(캡슐번호="확인할 타임캡슐의 번호(ID)")
 async def check_capsule_detail(interaction: discord.Interaction, 캡슐번호: int):
     try:
-        capsule = await asyncio.to_thread(db.get_capsule_by_id, 캡슐번호)
+        capsule = await db.get_capsule_by_id(캡슐번호)
     except Exception:
-        logger.exception("타임캡슐 조회 중 DB 오류 발생")
+        logger.exception("타임캡슐 조회 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
         await interaction.response.send_message(
             "❌ 타임캡슐 조회 중 오류가 발생했습니다.", ephemeral=True
         )
@@ -504,9 +526,9 @@ async def check_capsule_detail(interaction: discord.Interaction, 캡슐번호: i
 @app_commands.describe(캡슐번호="취소할 타임캡슐의 번호(ID)")
 async def cancel_time_capsule(interaction: discord.Interaction, 캡슐번호: int):
     try:
-        capsule = await asyncio.to_thread(db.get_capsule_by_id, 캡슐번호)
+        capsule = await db.get_capsule_by_id(캡슐번호)
     except Exception:
-        logger.exception("타임캡슐 취소 중 DB 조회 오류 발생")
+        logger.exception("타임캡슐 취소 중 DB 조회 오류 발생 (Supabase 연결 상태 확인 필요)")
         await interaction.response.send_message(
             "❌ 타임캡슐 조회 중 오류가 발생했습니다.", ephemeral=True
         )
@@ -530,9 +552,9 @@ async def cancel_time_capsule(interaction: discord.Interaction, 캡슐번호: in
         return
 
     try:
-        success = await asyncio.to_thread(db.cancel_capsule, 캡슐번호, str(interaction.user.id))
+        success = await db.cancel_capsule(캡슐번호, str(interaction.user.id))
     except Exception:
-        logger.exception("타임캡슐 취소 처리 중 DB 오류 발생")
+        logger.exception("타임캡슐 취소 처리 중 DB 오류 발생 (Supabase 연결 상태 확인 필요)")
         await interaction.response.send_message(
             "❌ 취소 처리 중 오류가 발생했습니다.", ephemeral=True
         )
