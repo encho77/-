@@ -2,18 +2,23 @@
 
 미래의 자신에게 메시지를 남기고, 지정한 기간이 지나면 DM으로 받아보는 Discord 봇입니다.
 
+> 📌 **DB 저장소: Supabase PostgreSQL** (기존 로컬 SQLite에서 전환됨)
+> Render에서 재배포/재시작이 발생해도 타임캡슐 데이터가 절대 사라지지 않습니다.
+
 ## 프로젝트 구조
 
 ```
 time-capsule-bot/
-├── main.py            # 봇 실행 파일 (슬래시 커맨드, UI, 백그라운드 작업)
-├── database.py         # SQLite 데이터베이스 접근 모듈
-├── requirements.txt    # 필요한 패키지 목록
+├── main.py                  # 봇 실행 파일 (슬래시 커맨드, UI, 백그라운드 작업) — 기능 변경 없음
+├── database.py               # Supabase(PostgreSQL) 접근 모듈 (asyncpg 기반, 완전 비동기)
+├── supabase_schema.sql       # Supabase SQL Editor에서 실행할 테이블 생성 스크립트
+├── migrate_to_supabase.py    # (선택) 기존 로컬 SQLite 데이터를 Supabase로 옮기는 1회성 스크립트
+├── requirements.txt          # 필요한 패키지 목록
 ├── .gitignore
 └── README.md
 ```
 
-## 기능
+## 기능 (변경 없음)
 
 | 명령어 | 설명 |
 |---|---|
@@ -23,162 +28,163 @@ time-capsule-bot/
 | `/타임캡슐취소 캡슐번호` | 아직 도착하지 않은 타임캡슐 취소 (이미 전송된 것은 취소 불가) |
 
 - 도착 시각이 되면 봇이 30초(기본값)마다 DB를 확인하여 자동으로 DM을 보냅니다.
-- 봇이 재시작되거나 Render에서 재배포되어도 SQLite에 저장된 타임캡슐은 그대로 유지되며, 이미 도착 시간이 지난 미전송 타임캡슐도 다시 켜지는 즉시 확인 후 전송됩니다.
 - 기간 계산은 30일 곱셈이 아닌 **실제 달(month) 기준**(`dateutil.relativedelta`)으로 계산되며, 한국 시간(KST, UTC+9) 기준으로 처리됩니다.
+- Render Web Service + UptimeRobot으로 무료 배포가 가능합니다 (Flask 헬스체크 엔드포인트 포함).
 
 ---
 
-## 1. Discord Developer Portal 설정
+## 🔄 이번에 무엇이 바뀌었나 (SQLite → Supabase)
+
+| 항목 | 이전 (SQLite) | 이후 (Supabase) |
+|---|---|---|
+| 저장소 | 로컬 파일 `database.db` | Supabase PostgreSQL (`time_capsules` 테이블) |
+| 재배포 시 데이터 | **사라질 수 있음** | **항상 유지됨** |
+| 연결 방식 | `sqlite3` + `threading.Lock`, `asyncio.to_thread`로 감쌈 | `asyncpg` 커넥션 풀, 완전 네이티브 비동기 |
+| 시간 저장 | ISO 8601 문자열 | PostgreSQL `TIMESTAMPTZ` (Python datetime 객체 그대로 사용) |
+| 환경변수 | `DATABASE_PATH` (선택) | `DATABASE_URL` (필수) |
+
+**기능, 명령어, Embed, 버튼, Modal, 에러 처리, 로그는 전혀 변경되지 않았습니다.** DB 저장 방식만 교체되었습니다.
+
+---
+
+## 1. Supabase 프로젝트 설정
+
+1. https://supabase.com 접속 → 회원가입/로그인 → **New Project** 생성
+2. 프로젝트 생성 시 설정한 **Database Password**를 기억해두세요 (연결 문자열에 필요)
+3. 왼쪽 메뉴 **SQL Editor** 이동 → `supabase_schema.sql` 파일 내용을 붙여넣고 **Run** 클릭
+   - (참고: 봇이 처음 실행될 때도 동일한 `CREATE TABLE IF NOT EXISTS`를 자동 실행하므로, 이 단계는 미리 확인하고 싶을 때만 하면 됩니다)
+4. 왼쪽 메뉴 **Project Settings → Database** 이동
+5. **Connection String** 섹션에서 **⚠️ "Session pooler"** 탭을 선택하세요 (아래 설명 참고)
+6. `URI` 형식의 연결 문자열을 복사하고, `[YOUR-PASSWORD]` 부분을 실제 비밀번호로 교체
+
+### ⚠️ 왜 "Session pooler"를 사용해야 하나요?
+
+Supabase의 **"Direct connection"**은 IPv6 주소로만 연결됩니다. Render를 포함한 대부분의 무료 호스팅 플랫폼은 **아웃바운드 IPv6를 지원하지 않아** Direct connection으로는 연결이 실패할 수 있습니다.
+
+- ✅ **Session pooler** (포트 5432): IPv4 지원, 이 봇처럼 상시 연결을 유지하는 애플리케이션에 적합 → **권장**
+- ⚠️ Transaction pooler (포트 6543): 서버리스 함수처럼 짧은 연결을 많이 맺는 경우용. 이 봇에는 불필요
+- ❌ Direct connection: IPv6 전용, Render에서 연결 실패 가능성 높음
+
+연결 문자열 예시 (Session pooler):
+```
+postgresql://postgres.xxxxxxxxxxxx:[YOUR-PASSWORD]@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres
+```
+
+---
+
+## 2. Discord Developer Portal 설정
 
 1. https://discord.com/developers/applications 접속 → **New Application** 생성
 2. 왼쪽 메뉴 **Bot** 탭 이동 → **Reset Token**으로 봇 토큰 발급 (이 값을 `TOKEN` 환경변수로 사용)
-3. **Privileged Gateway Intents**: 이 봇은 슬래시 커맨드와 DM 전송만 사용하므로 **MESSAGE CONTENT INTENT는 켤 필요 없습니다.** (기본값 그대로 두면 됩니다)
+3. **Privileged Gateway Intents**: 이 봇은 슬래시 커맨드와 DM 전송만 사용하므로 **MESSAGE CONTENT INTENT는 켤 필요 없습니다.**
 4. 왼쪽 메뉴 **OAuth2 → URL Generator** 이동
    - **SCOPES**: `bot`, `applications.commands` 체크
-   - **BOT PERMISSIONS**: `Send Messages`, `Embed Links`, `Use Slash Commands` 체크 (서버 채널에는 메시지를 보내지 않지만, 명령어 등록/실행을 위해 필요)
+   - **BOT PERMISSIONS**: `Send Messages`, `Embed Links`, `Use Slash Commands` 체크
 5. 생성된 URL로 접속하여 봇을 원하는 서버에 초대
-6. DM 전송을 위해서는 사용자가 **"서버 멤버로부터의 다이렉트 메시지 허용"** 설정을 켜두어야 합니다. (사용자가 차단한 경우 봇이 자동으로 감지하여 오류 없이 넘어갑니다)
+6. DM 전송을 위해서는 사용자가 **"서버 멤버로부터의 다이렉트 메시지 허용"** 설정을 켜두어야 합니다.
 
 ---
 
-## 2. 로컬에서 테스트하기
+## 3. 로컬에서 테스트하기
 
 ```bash
 # 1) 패키지 설치
 pip install -r requirements.txt
 
-# 2) 환경변수 설정 (Windows: set, macOS/Linux: export)
-# macOS/Linux
+# 2) 환경변수 설정
 export TOKEN="여기에_발급받은_봇_토큰"
-
-# Windows (PowerShell)
-$env:TOKEN="여기에_발급받은_봇_토큰"
+export DATABASE_URL="postgresql://postgres.xxxx:[YOUR-PASSWORD]@aws-0-xxxx.pooler.supabase.com:5432/postgres"
 
 # 3) 실행
 python main.py
 ```
 
-실행하면 다음이 출력됩니다:
-- `Flask 웹 서버 시작: 포트 5000` → 헬스 체크 엔드포인트 `http://localhost:5000/`이 실행됨
-- `봇 로그인 완료` → Discord 봇이 정상 실행 중
-
-`.env` 파일을 쓰고 싶다면 `python-dotenv`를 별도로 설치(`pip install python-dotenv`)한 뒤,
-`main.py` 최상단에 아래 두 줄을 추가하면 됩니다. (기본 프로젝트에는 의존성을 최소화하기 위해 포함하지 않았습니다)
-
-```python
-from dotenv import load_dotenv
-load_dotenv()
+정상 실행 시 로그 예시:
 ```
-
-> ⚠️ `.env` 파일에 토큰을 넣었다면 **절대 GitHub에 올리지 마세요.** `.gitignore`에 이미 `.env`가 포함되어 있습니다.
-
----
-
-## 3. GitHub 업로드
-
-```bash
-git init
-git add .
-git commit -m "타임캡슐 봇 초기 버전"
-git branch -M main
-git remote add origin <본인의 GitHub 저장소 URL>
-git push -u origin main
+Supabase(PostgreSQL) 커넥션 풀 생성 완료
+Supabase(PostgreSQL) 데이터베이스 초기화 완료
+Slash Command 4개 동기화 완료
+Flask 웹 서버 스레드 시작
+봇 로그인 완료: ...
 ```
-
-`.gitignore`에 `.env`, `database.db`가 포함되어 있으므로 토큰과 로컬 DB 파일은 업로드되지 않습니다.
 
 ---
 
 ## 4. Render 배포 (Web Service + UptimeRobot)
 
-**무료로 운영하려면 Web Service + UptimeRobot 조합을 사용하세요.**
+### 4-1. Render Web Service 설정
 
-### 4-1. Render에서 Web Service 설정
-
-1. https://render.com 접속 → **New → Web Service**
-2. GitHub 저장소 연결
-3. **Build Command**: `pip install -r requirements.txt`
-4. **Start Command**: `python main.py`
-5. **Environment** 탭에서 아래 변수 추가
+1. https://render.com → **New → Web Service** → GitHub 저장소 연결
+2. **Build Command**: `pip install -r requirements.txt`
+3. **Start Command**: `python main.py` (기존과 동일하게 유지됨)
 
 ### 4-2. Environment Variables (Render 대시보드 → Environment)
 
 | Key | Value | 설명 |
 |---|---|---|
-| `TOKEN` | 발급받은 봇 토큰 | 필수 |
-| `DATABASE_PATH` | 예: `/data/database.db` | 선택 (아래 5번 항목 참고) |
-| `MAX_CAPSULES_PER_USER` | 예: `10` | 선택, 사용자당 최대 보관 개수 (기본값 10) |
-| `CHECK_INTERVAL_SECONDS` | 예: `30` | 선택, 전송 확인 주기(초) (기본값 30) |
+| `TOKEN` | 발급받은 봇 토큰 | 필수 (기존과 동일) |
+| `DATABASE_URL` | Supabase Session pooler 연결 문자열 | **필수** (신규) |
+| `MAX_CAPSULES_PER_USER` | 예: `10` | 선택 (기존과 동일) |
+| `CHECK_INTERVAL_SECONDS` | 예: `30` | 선택 (기존과 동일) |
 
-### 4-3. Render Web Service 슬립 방지: UptimeRobot 연동
+> ℹ️ 기존에 사용하던 `DATABASE_PATH` 환경변수는 더 이상 사용되지 않습니다. (SQLite 파일 경로였음 — Supabase로 전환되며 불필요해짐) 설정되어 있어도 무시되니 지워도, 남겨둬도 무방합니다.
 
-Render의 무료 Web Service는 **15분간 요청이 없으면 자동으로 슬립**됩니다. 봇이 계속 깨어있으려면 **UptimeRobot**으로 주기적인 핑을 보내주세요.
+### 4-3. UptimeRobot 설정 (Render 슬립 방지 — 기존과 동일)
 
-#### UptimeRobot 설정 단계:
+1. https://uptimerobot.com → **Add New Monitor**
+2. **Monitor Type**: HTTP(s), **URL**: `https://your-render-url.onrender.com/`, **Interval**: 5분
+3. 저장
 
-1. https://uptimerobot.com 접속 → 회원가입/로그인
-2. **Add New Monitor** 클릭
-3. 설정값:
-   - **Monitor Type**: HTTP(s)
-   - **Friendly Name**: Time Capsule Bot 또는 원하는 이름
-   - **URL**: `https://your-render-url.onrender.com/` (Render 배포 후 생성되는 URL)
-   - **Monitoring Interval**: 5분 (기본값, 무료 플랜에서 지원하는 최단 간격)
-4. **Create Monitor** 클릭
-
-이제 UptimeRobot이 5분마다 봇의 웹 서버에 요청을 보내서 슬립을 방지합니다.
-
-> ✅ 이 봇 코드는 이미 Flask로 간단한 HTTP 서버를 포함하고 있습니다. 봇 로직은 백그라운드에서 계속 실행되며, Flask는 단순히 헬스 체크 역할을 합니다.
+> ⚠️ **중요**: UptimeRobot은 Render 프로세스가 잠들지 않게만 해줄 뿐입니다. 타임캡슐 데이터의 영구 저장은 전적으로 Supabase가 담당하므로, UptimeRobot 설정 여부와 무관하게 데이터는 안전합니다.
 
 ---
 
-## 5. ⚠️ Render 파일 저장(영속성) 관련 중요 안내
+## 5. 기존 SQLite 데이터 마이그레이션 (선택)
 
-Render의 기본 파일 시스템은 **재배포하거나 인스턴스가 교체될 때 초기화될 수 있습니다.**
-즉, `database.db`를 기본 경로(프로젝트 루트)에 그대로 두면, 코드를 다시 배포(Deploy)할 때마다 데이터가 사라질 수 있습니다.
+로컬 `database.db`에 이미 만들어둔 타임캡슐이 있다면, 아래 스크립트로 Supabase로 옮길 수 있습니다.
+**자동으로 실행되지 않으며, 실행 시 확인 메시지가 뜨고, 기존 SQLite 파일은 삭제하지 않습니다.**
 
-- 단순 **재시작(Restart)**이나 **크래시 후 자동 재기동**의 경우에는 대부분 동일 디스크가 유지되어 데이터가 보존됩니다.
-- 하지만 **Git push로 인한 재배포, 플랜 변경 등**의 경우에는 새 인스턴스로 교체되며 파일이 초기화될 수 있습니다.
-
-**해결 방법**: Render의 **Persistent Disk**(유료 애드온, Starter 플랜부터 지원)를 서비스에 연결하고, 환경변수 `DATABASE_PATH`를 디스크 마운트 경로로 지정하세요.
-
-```
-DATABASE_PATH=/data/database.db
+```bash
+export DATABASE_URL="postgresql://postgres.xxxx:[YOUR-PASSWORD]@aws-0-xxxx.pooler.supabase.com:5432/postgres"
+python migrate_to_supabase.py
+# 다른 경로의 SQLite 파일을 쓰려면: python migrate_to_supabase.py /path/to/database.db
 ```
 
-이 봇 코드는 `DATABASE_PATH` 환경변수를 지원하도록 이미 구현되어 있으며, 값이 없으면 프로젝트 루트의 `database.db`를 사용합니다. Persistent Disk 없이 무료로 운영할 경우, 재배포 시 타임캡슐 데이터가 사라질 수 있다는 점을 감안해주세요.
+실행하면 이전할 타임캡슐 개수를 보여주고 `y` 입력 시에만 진행합니다.
 
 ---
 
-## 6. 기능 테스트 방법
+## 6. 테스트 방법 (요청하신 3가지 시나리오)
 
-1. 디스코드 서버에서 `/타임캡슐` 입력
-2. 원하는 기간 버튼 클릭 (예: `1개월`)
-3. 팝업창(Modal)에 "안녕 미래의 나! 지금도 게임 열심히 하고 있니?" 입력 후 제출
-4. "⏳ 타임캡슐이 만들어졌어요!" 임베드와 캡슐 번호 확인
-5. `/내타임캡슐` 또는 `/타임캡슐조회 캡슐번호`로 상태(대기 중 / 남은 시간) 확인
-6. 테스트를 빠르게 하고 싶다면, 로컬에서 `main.py`의 `DURATION_OPTIONS`를 잠시 분 단위로 바꾸거나, `database.py`를 통해 직접 `delivery_at` 값을 과거 시각으로 수정한 뒤 봇을 실행하면 다음 확인 주기(`CHECK_INTERVAL_SECONDS`, 기본 30초)에 바로 DM이 전송되는 것을 확인할 수 있습니다.
-7. `/타임캡슐취소 캡슐번호`로 아직 도착하지 않은 캡슐을 취소해보고, 전송 완료된 캡슐은 취소가 거부되는지 확인
+### 테스트 1: 재배포 후 데이터 유지 확인
+1. `/타임캡슐` → 기간 선택 → 메시지 작성 → 생성 완료 확인
+2. Render 대시보드에서 **Manual Deploy → Deploy latest commit** (재배포)
+3. 재배포 완료 후 `/내타임캡슐` 실행 → 방금 만든 캡슐이 그대로 남아있는지 확인
 
-## 7. 재시작 후 데이터 유지 확인 방법
+### 테스트 2: 봇이 꺼져있는 동안 시간이 지난 경우
+1. Supabase 대시보드 → **Table Editor → time_capsules** → 테스트용 캡슐의 `delivery_at` 값을 현재 시각보다 과거로 직접 수정
+2. Render에서 봇을 잠시 중지했다가 다시 시작 (또는 로컬에서 봇 재시작)
+3. `CHECK_INTERVAL_SECONDS`(기본 30초) 이내에 DM이 오는지 확인
 
-1. `/타임캡슐`로 하나 생성 (예: 1개월 후 도착)
-2. `Ctrl+C`로 봇을 종료했다가 `python main.py`로 다시 실행
-3. `/내타임캡슐`로 방금 만든 캡슐이 여전히 남아있는지 확인 → 남아있다면 SQLite 저장이 정상 동작하는 것입니다.
-4. (장시간 정지 시나리오 테스트) `database.db`에서 특정 캡슐의 `delivery_at` 값을 현재 시각보다 과거로 직접 수정한 뒤 봇을 재시작 → `CHECK_INTERVAL_SECONDS` 이내에 바로 DM이 오는지 확인
+### 테스트 3: 중복 발송 방지 확인
+1. 테스트 2에서 DM을 받은 캡슐의 `delivered` 값이 Supabase에서 `true`로 바뀌었는지 확인
+2. 봇을 다시 재시작
+3. 같은 캡슐로 DM이 다시 오지 않는지 확인 (`delivered = false` 조건의 원자적 UPDATE로 보장됨)
+
+### Supabase에서 데이터 직접 확인하기
+Supabase 대시보드 → **Table Editor → time_capsules**에서 모든 타임캡슐의 실시간 상태(`delivered`, `cancelled`, `delivery_failed` 등)를 직접 볼 수 있습니다.
 
 ---
 
-## 8. 자주 발생하는 오류와 해결 방법
+## 7. 자주 발생하는 오류와 해결 방법
 
 | 증상 | 원인 / 해결 방법 |
 |---|---|
-| `RuntimeError: 환경변수 TOKEN이 설정되지 않았습니다` | `TOKEN` 환경변수를 설정하지 않음. 로컬은 `export TOKEN=...`, Render는 Environment 탭에서 설정 |
-| `discord.LoginFailure` | 토큰 값이 잘못됨. Developer Portal에서 토큰을 다시 발급받아 확인 |
-| 슬래시 커맨드가 디스코드에 안 보임 | 글로벌 동기화는 반영까지 최대 1시간 정도 걸릴 수 있음. 봇을 초대할 때 `applications.commands` 스코프를 빠뜨리지 않았는지 확인 |
-| DM이 오지 않음 | 사용자가 DM을 차단했거나 "서버 멤버의 다이렉트 메시지 허용"을 꺼둔 경우 (`/내타임캡슐`에서 "⚠️ 전송 실패"로 표시됨). 봇 로그에서 `discord.Forbidden` 관련 로그 확인 |
-| 재배포 후 타임캡슐이 사라짐 | Render의 파일 시스템 초기화 문제. 위 5번 항목 참고, Persistent Disk + `DATABASE_PATH` 설정 필요 |
-| 버튼을 눌러도 반응 없음 | `/타임캡슐` 메시지가 3분(180초)이 지나 만료됨. 명령어를 다시 실행 |
-| 같은 타임캡슐이 여러 번 전송될까 걱정됨 | DB 업데이트 시 `WHERE delivered = 0` 조건을 사용하므로 이미 전송된 캡슐은 다시 전송되지 않습니다 |
-| Render에서 15분마다 봇이 꺼짐 (Web Service) | UptimeRobot 설정을 확인하세요. URL이 정확한지 (예: `https://xxx.onrender.com/`), 모니터링이 활성화되었는지 확인 |
-| UptimeRobot이 404 에러를 나타냄 | 봇의 Render 배포 URL이 맞는지 확인. Render 대시보드의 URL을 그대로 복사해서 마지막에 `/` 를 붙여서 사용하세요 |
-| Flask 포트 충돌 에러 | 로컬에서 5000번 포트가 이미 사용 중일 수 있습니다. 다른 프로그램을 종료하거나, 환경변수 `PORT=8080` 같이 다른 포트로 설정 |
+| `환경변수 DATABASE_URL이 설정되지 않았습니다` (로그 경고) | Render Environment에 `DATABASE_URL`을 추가하지 않음. 봇은 계속 실행되지만 DB 관련 명령어는 오류 메시지를 반환함 |
+| 봇 실행은 되는데 `/타임캡슐` 생성 시 "데이터베이스 오류" | `DATABASE_URL` 값이 잘못됐거나 비밀번호가 틀림. Supabase 대시보드에서 연결 문자열을 다시 복사 |
+| 연결이 계속 타임아웃됨 | Direct connection(IPv6)을 사용 중일 가능성. **Session pooler** 연결 문자열(포트 5432)로 교체 |
+| `prepared statement "..." does not exist` 오류 | Transaction pooler(포트 6543) 사용 시 발생 가능. 이 코드는 `statement_cache_size=0`으로 방어 처리되어 있지만, 가급적 Session pooler 사용 권장 |
+| 같은 타임캡슐이 여러 번 전송될까 걱정됨 | `UPDATE ... WHERE delivered = FALSE` 조건의 원자적 쿼리를 사용하므로 이미 전송된 캡슐은 다시 전송되지 않음 |
+| Render 재배포 후에도 데이터가 사라짐 | Supabase가 아니라 여전히 로컬 SQLite를 쓰고 있는 것은 아닌지 `database.py`가 최신 버전인지 확인. `DATABASE_URL`이 정확히 설정되었는지도 확인 |
+| DM이 오지 않음 | 사용자가 DM을 차단했거나 "서버 멤버의 다이렉트 메시지 허용"을 꺼둔 경우. `/내타임캡슐`에서 "⚠️ 전송 실패"로 표시됨 |
+| Render에서 15분마다 봇이 꺼짐 | UptimeRobot Monitor URL과 Interval 설정 확인 |
